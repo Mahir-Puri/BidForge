@@ -114,4 +114,37 @@ bool Request::operator==(const Request &o) const {
     return std::tie(id, impression, tmax, width, height, floor, categories) ==
            std::tie(o.id, o.impression, o.tmax, o.width, o.height, o.floor, o.categories);
 }
+Bidder::Bidder(std::vector<Campaign> c, bool indexed, std::size_t capacity)
+    : campaigns_(std::move(c)), indexed_(indexed), capacity_(capacity),
+      accounts_(campaigns_.size()) {
+    if (capacity == 0)
+        throw std::invalid_argument("history capacity must be positive");
+    for (std::size_t i = 0; i < campaigns_.size(); ++i)
+        for (const auto &category : campaigns_[i].categories)
+            index_[category].push_back(i);
+}
+std::vector<std::size_t> Bidder::match(const Request &r) const {
+    std::vector<std::size_t> candidates;
+    if (indexed_) {
+        for (const auto &category : r.categories) {
+            auto found = index_.find(category);
+            if (found != index_.end())
+                candidates.insert(candidates.end(), found->second.begin(), found->second.end());
+        }
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    } else {
+        candidates.resize(campaigns_.size());
+        std::iota(candidates.begin(), candidates.end(), 0);
+    }
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                    [&](auto i) { return !eligible(campaigns_[i], r); }),
+                     candidates.end());
+    std::sort(candidates.begin(), candidates.end(), [&](auto a, auto b) {
+        if (campaigns_[a].bid != campaigns_[b].bid)
+            return campaigns_[a].bid > campaigns_[b].bid;
+        return campaigns_[a].id < campaigns_[b].id;
+    });
+    return candidates;
+}
 } // namespace bidforge
