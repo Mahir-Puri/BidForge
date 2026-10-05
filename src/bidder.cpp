@@ -147,4 +147,110 @@ std::vector<std::size_t> Bidder::match(const Request &r) const {
     });
     return candidates;
 }
+Reply Bidder::bid(const Request &r, Clock::time_point start) {
+    const auto matching_start = Clock::now();
+    const auto candidates = match(r);
+    const auto matching_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - matching_start).count();
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++received_;
+    ++matching_calls_;
+    matching_ns_ += static_cast<std::uint64_t>(matching_ns);
+    auto old = records_.find(r.id);
+    if (old != records_.end()) {
+        ++duplicates_;
+        if (!(old->second.request == r))
+            return error(409, "request ID reused with different content");
+        if (old->second.reply.status == 200)
+            ++bids_;
+        else
+            ++no_bids_;
+        return old->second.reply;
+    }
+    if (records_.size() >= capacity_) {
+        ++overload_;
+        return error(503, "request history full");
+    }
+    ++valid_;
+    Record record{r, {204, Json()}, 0, "none"};
+    const auto deadline = start + std::chrono::milliseconds(r.tmax);
+    bool expired = Clock::now() >= deadline;
+    if (!expired) {
+        for (auto i : candidates) {
+            const auto &c = campaigns_[i];
+            auto &account = accounts_[i];
+            if (c.bid > c.budget - account.committed - account.reserved)
+                continue;
+            const auto bid_id = "bid-" + r.id;
+            Json bid = {{"id", bid_id},
+                        {"impid", r.impression},
+                        {"price", static_cast<double>(c.bid) / 1000},
+                        {"cid", c.id},
+                        {"crid", c.creative},
+                        {"w", c.width},
+                        {"h", c.height}};
+            record.reply = {200,
+                            {{"id", r.id},
+                             {"cur", "USD"},
+                             {"seatbid", Json::array({{{"bid", Json::array({bid})}}})}}};
+            // Recheck after response construction, immediately before reserving.
+            if (Clock::now() >= deadline) {
+                expired = true;
+                record.reply = {204, Json()};
+                break;
+            }
+            record.campaign = i;
+            record.state = "pending";
+            break;
+        }
+    }
+    if (Clock::now() >= deadline && record.state == "none")
+        expired = true;
+    // Insert the record before changing money so allocation failures cannot lose a reservation.
+    auto inserted = records_.emplace(r.id, std::move(record)).first;
+    if (inserted->second.state == "pending") {
+        try {
+            bid_requests_.emplace("bid-" + r.id, r.id);
+        } catch (...) {
+            records_.erase(inserted);
+            throw;
+        }
+        if (Clock::now() >= deadline) {
+            bid_requests_.erase("bid-" + r.id);
+            inserted->second.state = "none";
+            inserted->second.reply = {204, Json()};
+            expired = true;
+        }
+    }
+    if (inserted->second.state == "pending") {
+        accounts_[inserted->second.campaign].reserved += campaigns_[inserted->second.campaign].bid;
+        ++bids_;
+    } else {
+        ++no_bids_;
+        if (expired)
+            ++deadlines_;
+    }
+    return inserted->second.reply;
+}
+Reply Bidder::outcome(const std::string &id, const std::string &result) {
+    if (result != "win" && result != "loss")
+        return error(400, "outcome must be win or loss");
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto found = bid_requests_.find(id);
+    if (found == bid_requests_.end())
+        return error(404, "unknown bid ID");
+    auto &record = records_.at(found->second);
+    const std::string target = result == "win" ? "won" : "lost";
+    if (record.state != "pending" && record.state != target)
+        return error(409, "conflicting outcome");
+    if (record.state == "pending") {
+        auto &account = accounts_[record.campaign];
+        const auto cost = campaigns_[record.campaign].bid;
+        record.state = target;
+        account.reserved -= cost;
+        if (target == "won")
+            account.committed += cost;
+    }
+    return {200, {{"state", record.state}}};
+}
 } // namespace bidforge
