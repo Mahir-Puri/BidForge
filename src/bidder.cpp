@@ -253,4 +253,45 @@ Reply Bidder::outcome(const std::string &id, const std::string &result) {
     }
     return {200, {{"state", record.state}}};
 }
+void Bidder::validation_failure() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++received_;
+    ++invalid_;
+}
+Json Bidder::stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Json s = {{"requests_received", received_},
+              {"valid_new_requests", valid_},
+              {"duplicate_requests", duplicates_},
+              {"bids_returned", bids_},
+              {"no_bids", no_bids_},
+              {"validation_failures", invalid_},
+              {"deadline_no_bids", deadlines_},
+              {"overload_rejections", overload_},
+              {"history_size", records_.size()},
+              {"matching_ns", matching_ns_},
+              {"matching_calls", matching_calls_},
+              {"pending", 0},
+              {"won", 0},
+              {"lost", 0},
+              {"invariant_violations", 0},
+              {"campaigns", Json::array()}};
+    for (const auto &item : records_)
+        if (item.second.state != "none") {
+            auto &count = s[item.second.state];
+            count = count.get<std::size_t>() + 1;
+        }
+    for (std::size_t i = 0; i < campaigns_.size(); ++i) {
+        const auto &a = accounts_[i];
+        const auto budget = campaigns_[i].budget;
+        if (a.committed < 0 || a.reserved < 0 || a.committed > budget ||
+            a.reserved > budget - a.committed)
+            s["invariant_violations"] = s["invariant_violations"].get<int>() + 1;
+        s["campaigns"].push_back({{"id", campaigns_[i].id},
+                                  {"budget_micros", budget},
+                                  {"committed_micros", a.committed},
+                                  {"reserved_micros", a.reserved}});
+    }
+    return s;
+}
 } // namespace bidforge
