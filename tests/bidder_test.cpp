@@ -142,3 +142,77 @@ TEST(Matching, EquivalentAcrossManyInputs) {
         EXPECT_EQ(baseline.bid(r, Clock::now()).body, indexed.bid(r, Clock::now()).body);
     }
 }
+TEST(Accounting, SettlementAndMissingFeedback) {
+    Bidder b(config(), true, 100);
+    EXPECT_EQ(bid(b, "r").status, 200);
+    EXPECT_EQ(b.stats()["campaigns"][0]["reserved_micros"], 3000);
+    EXPECT_EQ(b.outcome("bid-r", "win").status, 200);
+    EXPECT_EQ(b.outcome("bid-r", "win").status, 200);
+    EXPECT_EQ(b.outcome("bid-r", "loss").status, 409);
+    EXPECT_EQ(b.outcome("unknown", "win").status, 404);
+    EXPECT_EQ(b.outcome("bid-r", "invalid").status, 400);
+    bid(b, "loss");
+    b.outcome("bid-loss", "loss");
+    b.outcome("bid-loss", "loss");
+    bid(b, "pending");
+    auto s = b.stats();
+    EXPECT_EQ(s["campaigns"][0]["committed_micros"], 3000);
+    EXPECT_EQ(s["campaigns"][0]["reserved_micros"], 3000);
+    EXPECT_EQ(s["pending"], 1);
+    EXPECT_EQ(s["won"], 1);
+    EXPECT_EQ(s["lost"], 1);
+}
+TEST(Accounting, ConcurrentBudgetAndDuplicates) {
+    Bidder b(config(), true, 1000);
+    concurrent(64, [&](int i) { bid(b, std::to_string(i)); });
+    EXPECT_EQ(b.stats()["pending"], 10);
+    EXPECT_EQ(b.stats()["invariant_violations"], 0);
+    EXPECT_EQ(b.stats()["campaigns"][0]["reserved_micros"], 30000);
+    Bidder duplicates(config(), true, 100);
+    concurrent(32, [&](int) { EXPECT_EQ(bid(duplicates, "same").status, 200); });
+    EXPECT_EQ(duplicates.stats()["pending"], 1);
+    EXPECT_EQ(duplicates.stats()["duplicate_requests"], 31);
+    concurrent(32, [&](int) { EXPECT_EQ(duplicates.outcome("bid-same", "win").status, 200); });
+    EXPECT_EQ(duplicates.stats()["campaigns"][0]["committed_micros"], 3000);
+}
+TEST(Accounting, NormalizedDuplicatesCapacityAndDeadline) {
+    Bidder b(config(), true, 2);
+    auto r = parse_request(request());
+    auto first = b.bid(r, Clock::now());
+    auto raw = request();
+    raw["site"]["cat"] = {"sport", "sport"};
+    raw["imp"][0]["bidfloor"] = 0.0;
+    EXPECT_EQ(b.bid(parse_request(raw), Clock::now()).body, first.body);
+    r.width = 301;
+    EXPECT_EQ(b.bid(r, Clock::now()).status, 409);
+    r.id = "expired";
+    r.width = 300;
+    EXPECT_EQ(b.bid(r, Clock::now() - std::chrono::seconds(2)).status, 204);
+    EXPECT_EQ(b.bid(r, Clock::now()).status, 204);
+    EXPECT_EQ(bid(b, "full").status, 503);
+    EXPECT_EQ(bid(b, "r").status, 200);
+    EXPECT_EQ(b.stats()["deadline_no_bids"], 1);
+    EXPECT_EQ(b.stats()["history_size"], 2);
+}
+TEST(Accounting, FallsBackWhenHighestBudgetExhausted) {
+    auto a = campaign(), b = a;
+    a["budget_micros"] = 3000;
+    b["id"] = "b";
+    b["bid_milli_cpm"] = 2000;
+    Bidder bidder(parse_campaigns(Json::array({a, b})), true, 100);
+    EXPECT_EQ(bid(bidder, "one").body["seatbid"][0]["bid"][0]["cid"], "a");
+    EXPECT_EQ(bid(bidder, "two").body["seatbid"][0]["bid"][0]["cid"], "b");
+}
+TEST(Accounting, LargeIntegersDoNotOverflow) {
+    auto c = campaign();
+    c["budget_micros"] = std::numeric_limits<Money>::max();
+    c["bid_milli_cpm"] = max_bid;
+    Bidder b(config(c), true, 100);
+    concurrent(32, [&](int i) {
+        auto id = std::to_string(i);
+        bid(b, id);
+        b.outcome("bid-" + id, "win");
+    });
+    EXPECT_EQ(b.stats()["campaigns"][0]["committed_micros"], 32 * max_bid);
+    EXPECT_EQ(b.stats()["invariant_violations"], 0);
+}
