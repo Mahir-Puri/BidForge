@@ -1,0 +1,4 @@
+[
+  {"id":"sports-300","active":true,"categories":["IAB17"],"width":300,"height":250,"bid_milli_cpm":3000,"budget_micros":50000000,"creative_id":"banner-sports"},
+  {"id":"tech-300","active":true,"categories":["IAB19"],"width":300,"height":250,"bid_milli_cpm":2500,"budget_micros":20000000,"creative_id":"banner-tech"}
+]
